@@ -1,0 +1,8 @@
+COMPONENT=TestSerialAppC
+CFLAGS += -I$(TOSDIR)/lib/T2Hack
+CFLAGS += -DTOSH_DATA_LENGTH=114
+
+
+
+include $(MAKERULES)
+
