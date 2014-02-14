@@ -117,7 +117,8 @@ class DataTransmission
     bool dealloc_packet;
 	char  *message; // message to be sent
 	int msg_length; // length of the message (in bytes)
-	int RADIO_packetID;
+    uchar RADIO_packetID;
+    uchar recv_RADIO_packetID;
 
 	int create_INFO_Packet();
 	int create_ATC_Packet(int imgID, int nFeats, vector<uchar> kpts_bitstream, vector<uchar> feats_bitstream);
@@ -151,6 +152,8 @@ public:
 	commandType waitCMD_RADIO(serial_source src, actions *acts, double timeout = 0);
 
     int receivePacketRADIO(serial_source src, uchar **packet, int *packetLength, double timeout = 0);
+    int receiveDataPacketRADIO(serial_source src, uchar **packet, int *packetLength, double timeout = 0);
+
 	int closeSerialRADIO();
 
 	packetType parseMessage(uchar *packet);
@@ -160,7 +163,8 @@ public:
 	int getEncodedKeypoints(uchar *packet, int packetLength, imgInfo &info, vector<uchar> &enc_keypoints);
 	int getEncodedFeatures (uchar *packet, int packetLength, imgInfo &info, vector<uchar> &enc_features);
 	int getEncodedJPEG     (uchar *packet, int packetLength, vector<uchar> &enc_image);
-
+    uchar getPacketID();
+    uchar getRecvPacketID();
 };
 
 

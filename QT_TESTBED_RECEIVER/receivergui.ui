@@ -589,7 +589,8 @@ QGroupBox::title{
       </rect>
      </property>
      <property name="plainText">
-      <string>/dev/ttyUSB0</string>
+      <string>/dev/ttyUSB0
+</string>
      </property>
     </widget>
     <widget class="QPlainTextEdit" name="tx_delay">

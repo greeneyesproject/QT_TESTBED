@@ -24,6 +24,9 @@ ReceiverGUI::ReceiverGUI(QWidget *parent) :
     ui->lab_matchThr0->setVisible(false);
     ui->lab_matchThr255->setVisible(false);
     is_started = false;
+    ui->lab_recObj->setText("---");
+    ui->lab_fps->setText("---");
+    ui->lab_bw->setText("---");
 }
 
 ReceiverGUI::~ReceiverGUI()

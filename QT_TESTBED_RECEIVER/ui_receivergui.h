@@ -1,7 +1,7 @@
 /********************************************************************************
 ** Form generated from reading UI file 'receivergui.ui'
 **
-** Created: Tue Jan 28 15:56:17 2014
+** Created: Fri Feb 14 13:42:50 2014
 **      by: Qt User Interface Compiler version 4.8.1
 **
 ** WARNING! All changes made in this file will be lost when recompiling UI file!
@@ -331,7 +331,8 @@ public:
         label_10->setText(QApplication::translate("ReceiverGUI", "Transmission parameters", 0, QApplication::UnicodeUTF8));
         label_11->setText(QApplication::translate("ReceiverGUI", "Device", 0, QApplication::UnicodeUTF8));
         label_12->setText(QApplication::translate("ReceiverGUI", "Delay", 0, QApplication::UnicodeUTF8));
-        tx_radioDev->setPlainText(QApplication::translate("ReceiverGUI", "/dev/ttyUSB0", 0, QApplication::UnicodeUTF8));
+        tx_radioDev->setPlainText(QApplication::translate("ReceiverGUI", "/dev/ttyUSB0\n"
+"", 0, QApplication::UnicodeUTF8));
         tx_delay->setPlainText(QApplication::translate("ReceiverGUI", "10000", 0, QApplication::UnicodeUTF8));
         groupBox_4->setTitle(QString());
         label_13->setText(QApplication::translate("ReceiverGUI", "Received data", 0, QApplication::UnicodeUTF8));

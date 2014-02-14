@@ -5,6 +5,10 @@
 #include "utilities.hpp"
 #include "sort_like_matlab.h"
 
+#define BLOCK_H 96
+#define BLOCK_W 640
+#define BLOCK_ATC 10
+
 receiverManager::receiverManager(string imgDatabasePath_)
 {
 
@@ -111,7 +115,7 @@ receiverManager::receiverManager(string imgDatabasePath_)
         objRec->dCreateAddToDB(db_files[n]);
     }
 
-
+    image_reconstruction = false;
     // Initialize the inverse BRISK engine
     invBRISK = new inverse_BRISK(featExtract,640,480);
     invBRISK->build_database(imgDatabasePath);
@@ -132,12 +136,13 @@ void receiverManager::set_gui(ReceiverGUI *gui_)
 // This function activates the main thread
 bool receiverManager::start_mainProcess()
 {    
-    src = dataTx->openSerialRADIO(radioDevice.c_str(),115200,1);
+
+    src = dataTx->openSerialRADIO((const char*)(radioDevice.c_str()),115200,1);
     if(src==NULL){
-        cout << "Error opening the radio device " << radioDevice << endl;
+        cout << "Error opening the radio device " << endl;
         return false;
     }
-    main_process_active = true;    
+    main_process_active = true;
     reqActs.stop_program = false;
     this->start(); // start the main thread
     return true;
@@ -146,11 +151,11 @@ bool receiverManager::start_mainProcess()
 // This function stops the main thread
 bool receiverManager::end_mainProcess()
 {
-    dataTx->closeSerialRADIO(src);
+    //dataTx->closeSerialRADIO(src);
     main_process_active = false;
     reqActs.stop_program = true;
     return true;
-    //this->terminate();    
+    //this->terminate();
 }
 
 
@@ -167,15 +172,15 @@ void receiverManager::set_det_threshold(int thr)
 void receiverManager::set_mode(int mode)
 {
     switch(mode){
-        default:
-        case 0:
-            reqActs.atc = false;
-            reqActs.cta = true;
-            break;
-        case 1:
-            reqActs.atc = true;
-            reqActs.cta = false;
-            break;
+    default:
+    case 0:
+        reqActs.atc = false;
+        reqActs.cta = true;
+        break;
+    case 1:
+        reqActs.atc = true;
+        reqActs.cta = false;
+        break;
     }
 }
 
@@ -229,7 +234,7 @@ void receiverManager::run()
     int radio_dst = 1;
 
     // Content to be shown
-    Mat img_to_show;   // the image        
+    Mat img_to_show;   // the image
     Mat white_screen = 255 * Mat::ones(std_H,std_W,CV_8UC1);
     Mat black_screen =   0 * Mat::ones(std_H,std_W,CV_8UC3);
 
@@ -254,17 +259,21 @@ void receiverManager::run()
     pktInfo curPktInfo;
 
     // prepare vectors containing the received bitstreams
-    vector< vector<uchar> > kp_vectors;
-    vector< vector<uchar> > ft_vectors;
-    vector< int >           num_feats;
+    //vector< vector<uchar> > kp_vectors;
+    //vector< vector<uchar> > ft_vectors;
+    //vector< int >           num_feats;
 
     // vectors for received encoded bitstreams
     vector<uchar> rec_JPEGbuff;
     vector<uchar> rec_kpts;
     vector<uchar> rec_feats;
+    //vector< vector <uchar>> rec_JPEGbuffslice;
 
     // data structures for decoding bitstreams
     Mat dec_imJPEG;
+    Mat dec_blockJPEG;
+    vector<KeyPoint> kpts;         // will contain the keypoints (to perform obj recognition)
+    Mat features;          		   // will contain the feature vectors
 
     // send the START COMMAND
     dataTx->sendCMD_RADIO(src,radio_dst,START,&reqActs);
@@ -273,7 +282,7 @@ void receiverManager::run()
     bool end_loop = false;
     while(!end_loop){
 
-        bytes_received = 0;
+        //bytes_received = 0;
 
         // Handling the "IDLE" state
         // -----------------------------------------------------------------------
@@ -318,6 +327,8 @@ void receiverManager::run()
                 }
                 else{
                     cout << "Type: CTA" << endl;
+                    cout << "cur_img dim " << curImgInfo.h << " x " << curImgInfo.w << endl;
+
                 }
 
                 // Change state
@@ -340,8 +351,11 @@ void receiverManager::run()
                 imgToShow_1 = black_screen;
                 frameCounter = 0; // ...reset the frame counter...
                 timeFrame.clear();
+                recObject = "no object";
                 emit sig_update_image1(); // update the image on the display
                 curState = IDLE;  // ...and remain in the IDLE state
+
+
             }
             prevState = IDLE;
 
@@ -355,55 +369,128 @@ void receiverManager::run()
             // Send the ACK packet
             dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_INFO,curImgInfo.imageID);
 
-            cout << "Receiving JPEG bitstream........" << endl;
-            double time_start_tx = (double)getTickCount();
-            int err_ret = dataTx->receivePacketRADIO(src, &packet, &packetLength,PACKET_DEADLINE);
-            double time_end_tx = (double)getTickCount();
-            tx_time = (time_end_tx - time_start_tx)/getTickFrequency();
-            cout << "Done" << endl;
-            if (err_ret == 0){
-                pktType = dataTx->parseMessage(packet);
+            // BEGINNING OF NEW CODE
+            int num_blocks_row = ceil(((float)curImgInfo.h/(float)BLOCK_H));
+            int num_blocks_col = ceil(((float)curImgInfo.w/(float)BLOCK_W));
+            int num_blocks = num_blocks_col*num_blocks_row;
+            bool receiving = true;
+            uchar startPacketID = (dataTx->getRecvPacketID() + 1);
+            bytes_received = 0;
+            tx_time = 0;
+            //CREATE HERE A BLACK IMAGE
+            img_to_show = black_screen.clone();
 
-                cout << "Packet type: " << pktType << endl;
+            while(receiving){
+                cout << "Receiving JPEG bitstream........num blocks: " << num_blocks << endl;
+                double time_start_tx = (double)getTickCount();
+                int err_ret = dataTx->receiveDataPacketRADIO(src, &packet, &packetLength, PACKET_DEADLINE);
+                double time_end_tx = (double)getTickCount();
+                tx_time+= (time_end_tx - time_start_tx)/getTickFrequency();
+                if(err_ret==-2)
+                    tx_time -= PACKET_DEADLINE;
 
-                // if pktType == REQ_ACK_REC_INFO, re-send the ack
-                if ( pktType == REQ_ACK_REC_INFO ){
-                    dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_INFO,curImgInfo.imageID);
-                }
-                // if the packet contains data, then read it
-                else if ( pktType == CTA_IMG_PKT ){
+                uchar curPacketID = dataTx->getRecvPacketID();
 
-                    // read the packet info
-                    dataTx->getPacketInfo(packet,curPktInfo);
-                    cout << "packet length:" << packetLength << endl;
-                    if( curPktInfo.imageID == curImgInfo.imageID ){
+                if(err_ret==0){
+                    //CORRECTLY RECEIVED BLOCK, GLUE IT IN THE RIGHT PLACE
 
-                        // fill the JPEG buffer with the packet content
-                        rec_JPEGbuff.clear();
-                        for(int i=0; i<packetLength; i++){
-                            rec_JPEGbuff.push_back((uchar)packet[i]);
-                        }
+                    //int pkt_type = dataTx->getPacketInfo(packet,curPktInfo);
 
-                        curState = IMG_RECEIVED; // update the state
-                        cout << "ok" << endl;
-                    }
-                    else{
-                        cout << "WRONG IMG. ID!!!" << endl;
-                        curState = ERR_CTA; // set the error state
+                    // fill the JPEG buffer with the packet content
+                    rec_JPEGbuff.clear();
+                    for(int i=0; i<packetLength; i++){
+                        rec_JPEGbuff.push_back((uchar)packet[i]);
                     }
 
-                }
-                else{
-                    cout << "WRONG PKT TYPE" << endl;
-                    curState = ERR_CTA; // set the error state
-                }
-            }
-            else{
-                cout << "err_ret = " << err_ret << endl;
-                curState = ERR_CTA;
-            }
+                    //decode received block
+                    dec_blockJPEG = imdecode(rec_JPEGbuff,1);
 
+                    //glue decoded image in the right place
+                    uchar cur_block_id = curPacketID - startPacketID;
+                    int icol = cur_block_id%num_blocks_col;
+                    int irow = cur_block_id/num_blocks_col;
+                    int min_r = irow*BLOCK_H + std_H/2 - round(curImgInfo.h/2.0);
+                    int max_r = min((irow+1)*BLOCK_H,curImgInfo.h) + std_H/2 - round(curImgInfo.h/2.0);
+                    int min_c = icol*BLOCK_W + std_W/2 - round(curImgInfo.w/2.0);
+                    int max_c = min((icol+1)*BLOCK_W,curImgInfo.w) + std_W/2 - round(curImgInfo.w/2.0);
+
+
+                    Mat aux = img_to_show.rowRange(min_r,max_r).colRange(min_c,max_c);
+                    dec_blockJPEG.copyTo(aux);
+
+                    // Draw the image on the display
+                    imgToShow_1 = img_to_show;
+                    emit sig_update_image1();
+
+                    bytes_received+=rec_JPEGbuff.size();
+                }
+
+                //exit loop if last frame
+                if((uchar)(curPacketID - startPacketID) >= num_blocks-1 || err_ret==-3 ){
+                    receiving = false;
+                }
+            }
+            int min_r = std_H/2 - round(curImgInfo.h/2.0);
+            int max_r = curImgInfo.h + std_H/2 - round(curImgInfo.h/2.0);
+            int min_c = std_W/2 - round(curImgInfo.w/2.0);
+            int max_c = curImgInfo.w + std_W/2 - round(curImgInfo.w/2.0);
+            dec_imJPEG = img_to_show.rowRange(min_r,max_r).colRange(min_c,max_c).clone();
+            curState = IMG_RECEIVED;
             prevState = REC_CTA_IMG;
+            cout << "bytes received: " << bytes_received << endl;
+
+            // END OF NEW CODE
+
+
+            //            cout << "Receiving JPEG bitstream........" << endl;
+            //            double time_start_tx = (double)getTickCount();
+            //            int err_ret = dataTx->receivePacketRADIO(src, &packet, &packetLength,PACKET_DEADLINE);
+            //            double time_end_tx = (double)getTickCount();
+            //            tx_time = (time_end_tx - time_start_tx)/getTickFrequency();
+            //            cout << "Done" << endl;
+            //            if (err_ret == 0){
+            //                pktType = dataTx->parseMessage(packet);
+
+            //                cout << "Packet type: " << pktType << endl;
+
+            //                // if pktType == REQ_ACK_REC_INFO, re-send the ack
+            //                if ( pktType == REQ_ACK_REC_INFO ){
+            //                    dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_INFO,curImgInfo.imageID);
+            //                }
+            //                // if the packet contains data, then read it
+            //                else if ( pktType == CTA_IMG_PKT ){
+
+            //                    // read the packet info
+            //                    dataTx->getPacketInfo(packet,curPktInfo);
+            //                    cout << "packet length:" << packetLength << endl;
+            //                    if( curPktInfo.imageID == curImgInfo.imageID ){
+
+            //                        // fill the JPEG buffer with the packet content
+            //                        rec_JPEGbuff.clear();
+            //                        for(int i=0; i<packetLength; i++){
+            //                            rec_JPEGbuff.push_back((uchar)packet[i]);
+            //                        }
+
+            //                        curState = IMG_RECEIVED; // update the state
+            //                        cout << "ok" << endl;
+            //                    }
+            //                    else{
+            //                        cout << "WRONG IMG. ID!!!" << endl;
+            //                        curState = ERR_CTA; // set the error state
+            //                    }
+
+            //                }
+            //                else{
+            //                    cout << "WRONG PKT TYPE" << endl;
+            //                    curState = ERR_CTA; // set the error state
+            //                }
+            //            }
+            //            else{
+            //                cout << "err_ret = " << err_ret << endl;
+            //                curState = ERR_CTA;
+            //            }
+
+            //            prevState = REC_CTA_IMG;
 
 
         }
@@ -414,125 +501,265 @@ void receiverManager::run()
         else if(curState == REC_ATC_IMG){
 
             // Send the ACK packet
+            cout << "sending ACK" << endl;
             dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_INFO,curImgInfo.imageID);
 
             // Clear the vectors
-            kp_vectors.clear();
-            ft_vectors.clear();
-            num_feats.clear();
+            //kp_vectors.clear();
+            //ft_vectors.clear();
+            //num_feats.clear();
+            kpts.clear();
+            bytes_received = 0;
 
-            int countRecFeats = 0;
-            bool errors = false;
+            //int countRecFeats = 0;
+            //bool errors = false;
 
             cout << "Receiving visual features.........." << endl;
+            cout << "imageID " << curImgInfo.imageID << endl;
+            //double time_start_tx = (double)getTickCount();
+            //int err_ret;
 
-            double time_start_tx = (double)getTickCount();
-            int err_ret;
+            //beginning of new code
+            bool receiving = true;
+            uchar startPacketID = (dataTx->getRecvPacketID() + 1);
+            bytes_received = 0;
+            tx_time = 0;
+            int num_blocks = ceil((float)curImgInfo.nFeats/(float)BLOCK_ATC);
+            int num_feats_last_block = curImgInfo.nFeats % BLOCK_ATC;
+            if(num_feats_last_block == 0)
+                 num_feats_last_block = BLOCK_ATC;
 
-            err_ret = dataTx->receivePacketRADIO(src, &packet, &packetLength,PACKET_DEADLINE/2);
+            cout << "num_feats_last_block" << num_feats_last_block << endl;
 
-            if(err_ret == 0){
+            //CREATE HERE A WHITE IMAGE
+            img_to_show = white_screen.clone();
+            bool first_it=true;
+            while(receiving){
+                cout << "image rec " << (int)image_reconstruction << endl;
+                cout << "first it " << (int)first_it << endl;
+                cout << "Receiving ATC bitstream........num blocks: " << num_blocks << endl;
+                double time_start_tx = (double)getTickCount();
+                int err_ret = dataTx->receiveDataPacketRADIO(src, &packet, &packetLength, PACKET_DEADLINE);
+                double time_end_tx = (double)getTickCount();
+                tx_time+= (time_end_tx - time_start_tx)/getTickFrequency();
+                if(err_ret==-2)
+                    tx_time -= PACKET_DEADLINE;
 
-                pktType = dataTx->parseMessage(packet);
+                uchar curPacketID = dataTx->getRecvPacketID();
 
-                // NOT VERY SURE...
-                /*
-                if (ctrl != 0){
-                    do{
-                        ctrl = dataTx->receivePacketRADIO(src, &packet, &packetLength);
-                        pktType = dataTx->parseMessage(packet);
-                        if (ctrl == 0 && pktType==REQ_ACK_REC_INFO){
-                            dataTx->sendACK_RADIO(src,ACK_REC_INFO,curImgInfo.imageID);
+                if(err_ret==0){
+                    //CORRECTLY RECEIVED BLOCK OF FEATURES, GLUE IT IN THE RIGHT PLACE
+                    //int pkt_type = dataTx->getPacketInfo(packet,curPktInfo);
+
+                    // Read the keypoints
+                    int w_log2 = ceil(log2(curImgInfo.w));
+                    int h_log2 = ceil(log2(curImgInfo.h));
+                    int imW_pix = curImgInfo.w;
+                    int imH_pix = curImgInfo.h;
+                    int kp_streamLength;
+                    cout << "curPacketID " << (int)curPacketID << endl;
+                    cout << "startPacketID " << (int)startPacketID << endl;
+                    if((uchar)(curPacketID - startPacketID) == num_blocks-1)
+                        kp_streamLength = (w_log2 + h_log2 + 23)*num_feats_last_block;
+                    else
+                        kp_streamLength = (w_log2 + h_log2 + 23)*BLOCK_ATC;
+
+                    kp_streamLength = ceil ( (float)kp_streamLength / 8.0 );
+                    cout << "kp_streamLength" << kp_streamLength << endl;
+
+                    cout << "filling keypoints" << endl;
+                    rec_kpts.clear();
+                    for(int i=0; i<kp_streamLength; i++){
+                        rec_kpts.push_back(packet[i+1]);
+                    }
+                    //kp_vectors.push_back(rec_kpts);
+
+                    cout << "filling features" << endl;
+                    // Read the features
+                    rec_feats.clear();
+                    for(int i=kp_streamLength; i<packetLength-1; i++){
+                        rec_feats.push_back(packet[i+1]);
+                    }
+                    //ft_vectors.push_back(rec_feats);
+
+                    cout << "decoding keypoints" << endl;
+                    //decode received keypoints
+                    vector<KeyPoint> cur_dec_kpts, kpts_to_show;
+                    decoder.decodeKeyPoints(rec_kpts, cur_dec_kpts,imW_pix,imH_pix,true);
+
+                    cout << "decoding features" << endl;
+                    //decode received features
+                    Mat cur_dec_feats;
+                    if(curImgInfo.compressed == true){
+                        if((uchar)(curPacketID - startPacketID) == num_blocks-1)
+                            decoder.decodeBinaryDescriptors(curImgInfo.descName, rec_feats, cur_dec_feats, num_feats_last_block);
+                        else
+                            decoder.decodeBinaryDescriptors(curImgInfo.descName, rec_feats, cur_dec_feats, BLOCK_ATC);
+                    }
+                    else{
+                        decoder.dummy_decodeBinaryDescriptors(curImgInfo.descName,rec_feats, cur_dec_feats);
+                    }
+
+
+                    cout << "copy into global vars" << endl;
+                    //copy rec features and keypoints in global structures
+                    for(unsigned int i=0;i<cur_dec_kpts.size();i++){
+                        kpts.push_back(cur_dec_kpts[i]);
+                    }
+                    if(first_it){
+                        features = cur_dec_feats.clone();
+                        first_it = false;
+                    }
+                    else{
+                        vconcat(features, cur_dec_feats, features);
+                    }
+
+
+                    cout << "draw" << endl;
+                    //glue decoded features in the right place
+                    kpts_to_show = cur_dec_kpts;
+                    if (imH_pix<std_H || imW_pix<std_W){
+                        for(unsigned int i=0; i<cur_dec_kpts.size(); i++){
+                            kpts_to_show[i].pt.x += std_W/2 - round(imW_pix/2.0);
+                            kpts_to_show[i].pt.y += std_H/2 - round(imH_pix/2.0);
                         }
                     }
-                    while(pktType == REQ_ACK_REC_INFO);
+
+                    // prepare the image to be displayed (white img + keypoints)
+                    drawKeypoints(img_to_show,kpts_to_show,img_to_show,Scalar(255,0,0),DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
+
+                    // Draw the image on the display
+                    imgToShow_1 = img_to_show;
+                    emit sig_update_image1();
+
+                    //update received bytes
+                    bytes_received += rec_feats.size() + rec_kpts.size();
+                    cout << "kpts received: " << cur_dec_kpts.size() <<endl;
+                    cout << "feat received: " << cur_dec_feats.rows << endl;
                 }
-                */
 
-
-                if ( pktType == REQ_ACK_REC_INFO ){ // if pktType == REQ_ACK_REC_INFO, re-send the ack
-                    dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_INFO,curImgInfo.imageID);
-                }
-
-                else{ // else receive data
-
-                    do
-                    { // loop until all packets are received, or some errors occur
-
-                        if( pktType == ATC_IMG_PKT ){
-
-                            dataTx->getPacketInfo(packet,curPktInfo);
-
-                            if( curPktInfo.imageID == curImgInfo.imageID ){
-
-                                // update the counter of received features
-                                countRecFeats += curPktInfo.nFeats;
-
-                                // Store the number of features contained in the current packet
-                                num_feats.push_back(curPktInfo.nFeats);
-
-                                // Read the keypoints
-                                int w_log2 = ceil(log2(curImgInfo.w));
-                                int h_log2 = ceil(log2(curImgInfo.h));
-                                //int kp_streamLength = (w_log2 + h_log2 + 14)*curPktInfo.nFeats;
-                                int kp_streamLength = (w_log2 + h_log2 + 23)*curPktInfo.nFeats;
-                                kp_streamLength = ceil ( (float)kp_streamLength / 8.0 );
-                                rec_kpts.clear();
-                                for(int i=0; i<kp_streamLength; i++){
-                                    rec_kpts.push_back(packet[i+1]);
-                                }
-                                kp_vectors.push_back(rec_kpts);
-
-                                // Read the features
-                                rec_feats.clear();
-                                for(int i=kp_streamLength; i<packetLength-1; i++){
-                                    rec_feats.push_back(packet[i+1]);
-                                }
-                                ft_vectors.push_back(rec_feats);
-
-                                // Update the state
-                                curState = IMG_RECEIVED;
-                                cout << "ok" << endl;
-                            }
-                            else{ // error: imgID mismatch
-                                cout << "WRONG IMG. ID!!!" << endl;
-                                errors = true;
-                            }
-
-                        }
-                        else{
-                            cout << "WRONG PACKET TYPE!!!" << endl;
-                            errors = true; // wrong packet type
-                        }
-
-                        // if no errors, read the next packet
-                        if (countRecFeats < curImgInfo.nFeats && !errors){
-                            err_ret = dataTx->receivePacketRADIO(src, &packet, &packetLength, PACKET_DEADLINE/2);
-                            if (err_ret==0){
-                                pktType = dataTx->parseMessage(packet);
-                            }
-                            else{
-                                errors = true;
-                            }
-                        }
-
-                    }
-                    while( countRecFeats < curImgInfo.nFeats && !errors );
-
+                //exit loop if last frame
+                //
+                if( (uchar)(curPacketID - startPacketID) >= num_blocks-1 || err_ret==-3 ){
+                    receiving = false;
+                    cout <<  "exiting loop because: err_ret " << err_ret << "cur_packet" << (uchar)(curPacketID - startPacketID) << "-" << num_blocks-1 << endl;
                 }
             }
-            else{
-                curState = ERR_CTA;
-            }
+            //ending of new code
 
-            if(errors){
-                curState = ERR_CTA;
-            }
+//            err_ret = dataTx->receivePacketRADIO(src, &packet, &packetLength,PACKET_DEADLINE/2);
 
-            double time_end_tx = (double)getTickCount();
-            tx_time = (time_end_tx - time_start_tx)/getTickFrequency();
+//            if(err_ret == 0){
 
+//                pktType = dataTx->parseMessage(packet);
+
+//                // NOT VERY SURE...
+//                /*
+//                if (ctrl != 0){
+//                    do{
+//                        ctrl = dataTx->receivePacketRADIO(src, &packet, &packetLength);
+//                        pktType = dataTx->parseMessage(packet);
+//                        if (ctrl == 0 && pktType==REQ_ACK_REC_INFO){
+//                            dataTx->sendACK_RADIO(src,ACK_REC_INFO,curImgInfo.imageID);
+//                        }
+//                    }
+//                    while(pktType == REQ_ACK_REC_INFO);
+//                }
+//                */
+
+
+//                if ( pktType == REQ_ACK_REC_INFO ){ // if pktType == REQ_ACK_REC_INFO, re-send the ack
+//                    dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_INFO,curImgInfo.imageID);
+//                }
+
+//                else{ // else receive data
+
+//                    do
+//                    { // loop until all packets are received, or some errors occur
+
+//                        if( pktType == ATC_IMG_PKT ){
+
+//                            dataTx->getPacketInfo(packet,curPktInfo);
+
+//                            if( curPktInfo.imageID == curImgInfo.imageID ){
+
+//                                // update the counter of received features
+//                                countRecFeats += curPktInfo.nFeats;
+
+//                                // Store the number of features contained in the current packet
+//                                num_feats.push_back(curPktInfo.nFeats);
+
+//                                // Read the keypoints
+//                                int w_log2 = ceil(log2(curImgInfo.w));
+//                                int h_log2 = ceil(log2(curImgInfo.h));
+//                                //int kp_streamLength = (w_log2 + h_log2 + 14)*curPktInfo.nFeats;
+//                                int kp_streamLength = (w_log2 + h_log2 + 23)*curPktInfo.nFeats;
+//                                kp_streamLength = ceil ( (float)kp_streamLength / 8.0 );
+//                                rec_kpts.clear();
+//                                for(int i=0; i<kp_streamLength; i++){
+//                                    rec_kpts.push_back(packet[i+1]);
+//                                }
+//                                kp_vectors.push_back(rec_kpts);
+
+//                                // Read the features
+//                                rec_feats.clear();
+//                                for(int i=kp_streamLength; i<packetLength-1; i++){
+//                                    rec_feats.push_back(packet[i+1]);
+//                                }
+//                                ft_vectors.push_back(rec_feats);
+
+//                                // Update the state
+//                                curState = IMG_RECEIVED;
+//                                cout << "ok" << endl;
+//                            }
+//                            else{ // error: imgID mismatch
+//                                cout << "WRONG IMG. ID!!!" << endl;
+//                                errors = true;
+//                            }
+
+//                        }
+//                        else{
+//                            cout << "WRONG PACKET TYPE!!!" << endl;
+//                            errors = true; // wrong packet type
+//                        }
+
+//                        // if no errors, read the next packet
+//                        if (countRecFeats < curImgInfo.nFeats && !errors){
+//                            err_ret = dataTx->receivePacketRADIO(src, &packet, &packetLength, PACKET_DEADLINE/2);
+//                            if (err_ret==0){
+//                                pktType = dataTx->parseMessage(packet);
+//                            }
+//                            else{
+//                                errors = true;
+//                            }
+//                        }
+
+//                    }
+//                    while( countRecFeats < curImgInfo.nFeats && !errors );
+
+//                }
+//            }
+//            else{
+//                curState = ERR_CTA;
+//            }
+
+//            if(errors){
+//                curState = ERR_CTA;
+//            }
+
+//            double time_end_tx = (double)getTickCount();
+//            tx_time = (time_end_tx - time_start_tx)/getTickFrequency();
+
+
+            curState = IMG_RECEIVED;
+            cout << "ok" << endl;
             prevState = REC_ATC_IMG;
+            cout << "bytes received: " << bytes_received << endl;
+            if(kpts.size() == 0){
+                dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_IMG,curImgInfo.imageID,&reqActs);
+                end_loop = reqActs.stop_program;
+                curState = IDLE;
+            }
 
         }
 
@@ -540,7 +767,6 @@ void receiverManager::run()
         // Handling the "IMG_RECEIVED" state
         // -----------------------------------------------------------------------
         else if(curState == IMG_RECEIVED){
-
 
             // Set the new commands according to the options selected on the gui
             dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_IMG,curImgInfo.imageID,&reqActs);
@@ -552,18 +778,18 @@ void receiverManager::run()
                 // Here: 1) show the keypoints (if ATC) or the image+kpts (if CTA)
                 //       2) perform object recognition
                 //       3) display results
-
                 vector<KeyPoint> kpts_to_show; // will contain the keypoints to be shown
-                vector<KeyPoint> kpts;         // will contain the keypoints (to perform obj recognition)
-                Mat features;          		   // will contain the feature vectors
+
 
 
                 if( curImgInfo.atc_cta == false ){
 
                     // decode the JPEG stream
-                    dec_imJPEG = imdecode(rec_JPEGbuff,1);
+                    //dec_imJPEG = imdecode(rec_JPEGbuff,1);
+                    //INSTEAD OF DOING THIS, ASSIGN TO dec_imJPEG the glued image.
 
-                    bytes_received = rec_JPEGbuff.size();
+                    //bytes_received = rec_JPEGbuff.size();
+                    //NOT NEEDED, DONE IN CTA REC IMAGE
 
                     cout << "Image JPEG received and decoded successfully:" << endl;
                     cout << "ImageID = " << curImgInfo.imageID << endl;
@@ -587,11 +813,11 @@ void receiverManager::run()
 
                     if (curH<std_H || curW<std_W){
 
-                        img_to_show = black_screen.clone();
+                        //img_to_show = black_screen.clone();
                         int min_c = std_W/2 - round(curW/2.0);
                         int min_r = std_H/2 - round(curH/2.0);
-                        Mat aux = img_to_show.rowRange(min_r,min_r+curH).colRange(min_c,min_c+curW);
-                        dec_imJPEG.copyTo(aux);
+                        //Mat aux = img_to_show.rowRange(min_r,min_r+curH).colRange(min_c,min_c+curW);
+                        //dec_imJPEG.copyTo(aux);
 
                         for(unsigned int i=0; i<kpts.size(); i++){
                             kpts_to_show[i].pt.x += min_c;
@@ -610,22 +836,22 @@ void receiverManager::run()
                 else{
 
                     //decode the keypoints and the features
-                    kpts.clear();
+                    //kpts.clear();
 
-                    vector<KeyPoint> cur_dec_kpts;
+                    //vector<KeyPoint> cur_dec_kpts;
 
-                    int imW_pix = curImgInfo.w;
-                    int imH_pix = curImgInfo.h;
+                    //int imW_pix = curImgInfo.w;
+                    //int imH_pix = curImgInfo.h;
 
-                    for(unsigned int i=0; i<kp_vectors.size(); i++){
+                    /*for(unsigned int i=0; i<kp_vectors.size(); i++){
                         decoder.decodeKeyPoints(kp_vectors[i], cur_dec_kpts,imW_pix,imH_pix,true);
                         kpts.insert( kpts.end(), cur_dec_kpts.begin(), cur_dec_kpts.end() );
                         bytes_received += kp_vectors[i].size();
-                    }
-                    cout << "NUMBER OF DECODED KPTS: " << kpts.size() << endl;
+                    }*/
+                    //cout << "NUMBER OF DECODED KPTS: " << kpts.size() << endl;
 
 
-                    Mat dec_feats, cur_dec_feats;
+                    /*Mat dec_feats, cur_dec_feats;
 
                     for(unsigned int i=0; i<ft_vectors.size(); i++){
 
@@ -645,24 +871,25 @@ void receiverManager::run()
                             vconcat(dec_feats, cur_dec_feats, dec_feats);
                         }
 
-                    }
+                    }*/
 
 
                     // center the image and the keypoints, if needed
-                    kpts_to_show = kpts;
+                    /*kpts_to_show = kpts;
 
                     if (imH_pix<std_H || imW_pix<std_W){
                         for(unsigned int i=0; i<kpts.size(); i++){
                             kpts_to_show[i].pt.x += std_W/2 - round(imW_pix/2.0);
                             kpts_to_show[i].pt.y += std_H/2 - round(imH_pix/2.0);
                         }
-                    }
+                    }*/
 
                     // prepare the image to be displayed (white img + keypoints)
-                    img_to_show = white_screen.clone();                    
+                    /*img_to_show = white_screen.clone();
                     drawKeypoints(img_to_show,kpts_to_show,img_to_show,Scalar(255,0,0),DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
+                    */
 
-                    Scalar sf = sum(dec_feats);
+                    Scalar sf = sum(features);
                     double sk = 0;
                     for(unsigned int i=0; i<kpts.size();i++){
                         sk += kpts[i].pt.x + kpts[i].pt.y + kpts[i].size;
@@ -670,7 +897,7 @@ void receiverManager::run()
 
                     cout << "CONTROL VALUES: " << sf[0] << " , " << sk << endl;
 
-                    features = dec_feats.clone();
+                    //features = dec_feats.clone();
 
                     cout << endl << "Visual features received and decoded successfully" << endl;
 
@@ -685,14 +912,14 @@ void receiverManager::run()
 
                 cout << "OBJECT RECOGNITION....." << endl;
                 ranking = objRec->rankedQueryDB(kpts, // keypoints of the query image
-                                  features,           // features of the query image
-                                  distances,
-                                  do_bin_ratio_test,         // enable/disable ratio-test for binary descriptors
-                                  124/2,       // distance threshold for nearest neighbour test
-                                  DEFAULT_NNDR_RATIO,        // ratio-test threshold
-                                  1,                 // enable/disable ransac
-                                  DEFAULT_RANSAC_MIN_MATCHES,// minimum number of matches
-                                  DEFAULT_RANSAC_THRESHOLD );// maximum allowed reprojection error
+                                                features,           // features of the query image
+                                                distances,
+                                                do_bin_ratio_test,         // enable/disable ratio-test for binary descriptors
+                                                124/2,       // distance threshold for nearest neighbour test
+                                                DEFAULT_NNDR_RATIO,        // ratio-test threshold
+                                                1,                 // enable/disable ransac
+                                                DEFAULT_RANSAC_MIN_MATCHES,// minimum number of matches
+                                                DEFAULT_RANSAC_THRESHOLD );// maximum allowed reprojection error
 
                 cout << "OK" << endl;
 
@@ -719,7 +946,7 @@ void receiverManager::run()
                     }
                 }
                 else{
-                    recObject = "n.r.";
+                    recObject = "not recognized";
                 }
 
 
@@ -749,6 +976,7 @@ void receiverManager::run()
 
                     framesPerSecond = (float) (1.0 / meanTimeFrame);
                     bandwidth = ((float)bytes_received*8.0/1000.0)/tx_time;
+                    cout << "stats:" <<  bytes_received << " " << tx_time << endl;
                 }
 
 
@@ -759,7 +987,7 @@ void receiverManager::run()
                 // If enabled, reconstruct the image from the descriptors
                 if(image_reconstruction==true & curImgInfo.atc_cta == true){
                     cout << "inverting BRISK..." << endl;
-                    imgToShow_2 = invBRISK->invert_BRISK(features,kpts_to_show,match_threshold);
+                    imgToShow_2 = invBRISK->invert_BRISK(features,kpts,match_threshold);
                     cout << "OK!" << endl;
                     emit sig_update_image2();
                 }
@@ -796,8 +1024,8 @@ void receiverManager::run()
     }
 
     // send some extra ACK
-    dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_IMG,curImgInfo.imageID,&reqActs);
-    dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_IMG,curImgInfo.imageID,&reqActs);
-    dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_IMG,curImgInfo.imageID,&reqActs);
+    //dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_IMG,curImgInfo.imageID,&reqActs);
+    //dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_IMG,curImgInfo.imageID,&reqActs);
+    //dataTx->sendACK_RADIO(src,radio_dst,ACK_REC_IMG,curImgInfo.imageID,&reqActs);
 }
 

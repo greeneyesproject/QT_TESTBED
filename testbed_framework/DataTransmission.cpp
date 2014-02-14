@@ -73,7 +73,7 @@ serial_source DataTransmission::openSerialRADIO(const char *serial_device, int b
     dealloc_packet = false;
 	serial_source src;
 	src = open_serial_source(serial_device, baud_rate, non_blocking, stderr_msg);
-	RADIO_packetID = -1;
+    RADIO_packetID = 0xFF;
 	if(!src)
 		return NULL;
 	else
@@ -100,9 +100,18 @@ int DataTransmission::sendImgInfoRADIO(serial_source src, int radio_dst, int img
 
 	if (atc_cta == false){ // CTA paradigm
 
-        message = (char*)malloc(1);
+        message = (char*)malloc(4);
         message[0]  = 0x55; // identifier for CTA (MSB = 0)
-        msg_length  = 1;
+
+        // set byte 2, 3, 4: image size
+        // 12 bits for imWidth, 12 bits for imHeight
+        // max 4095 x 4095
+        message[1]  = (uchar)( (imWidth >> 4 ) & 0x00FF );
+        message[2]  = (uchar)( (imWidth << 4 ) & 0x00F0 );
+        message[2] |= (uchar)( (imHeight >> 8) & 0x000F );
+        message[3]  = (uchar)( imHeight & 0x00FF );
+
+        msg_length  = 4;
 
 	}
 	else{ // ATC paradigm
@@ -412,7 +421,172 @@ commandType DataTransmission::waitCMD_RADIO(serial_source src, actions *acts, do
 
 }
 
+int DataTransmission::receiveDataPacketRADIO(serial_source src, uchar **packet_, int *packetLength, double timeout){
 
+    double initTime = (double)cv::getTickCount();
+    double waitTime = 0;
+
+    if(dealloc_packet == true){
+        free(packet);
+        dealloc_packet = false;
+    }
+
+    //uchar *temp_packet;
+
+    int curPacketID = -1;
+    int numFrames = -1;
+
+    uchar *frame = NULL;
+
+    int tot_header_length = RADIO_HEADER_LENGTH + APP_HEADER_LENGTH;
+    int maxFrameLength = MAX_RADIO_PAYLOAD_LENGTH - APP_HEADER_LENGTH;
+
+    int len;
+    int idx = 0;
+
+    // Wait until the first frame is received
+    bool firstFrame = false;
+    bool packetComplete = false;
+    bool timeout_expired = false;
+
+    while( !firstFrame && !timeout_expired ){
+        int aux_pkt_info;
+        frame = (uchar*)read_serial_packet(src, &len);
+
+        if(frame){
+            cout << "frame received: " << (int)frame[15] << " " << (int)frame[16] << " " << (int)frame[17] << endl;
+            packet_info = frame[17];
+            curPacketID = (int)frame[12];
+            recv_RADIO_packetID = curPacketID;
+            aux_pkt_info = (int) ((packet_info >> 4)&0x0F);
+            cout << "packet info: " << aux_pkt_info<< endl;
+
+        }
+
+
+
+        if( frame && (int)frame[15] == 0 && (int)frame[16] == 0 && (aux_pkt_info==CTA_IMG_PKT || aux_pkt_info==ATC_IMG_PKT)){
+            
+            curPacketID = (int)frame[12];
+            numFrames   = *(unsigned short*)&frame[13];
+            packet = (uchar*)malloc(maxFrameLength*numFrames);
+            dealloc_packet = true;
+            memcpy( &packet[idx], &frame[tot_header_length], len-tot_header_length );
+            idx+= len - tot_header_length;
+            firstFrame = true;
+            if (numFrames == 1){
+                packetComplete = true;
+            }
+        }
+        else if(timeout>0){
+            waitTime = ((double)cv::getTickCount() - initTime)/cv::getTickFrequency();
+            if(waitTime > timeout){
+                timeout_expired = true;
+                return -2;
+            }
+        }
+
+        if(frame && aux_pkt_info!=CTA_IMG_PKT && aux_pkt_info!=ATC_IMG_PKT)
+            return -3;
+
+        if (frame){
+            free(frame);
+        }
+
+    }
+
+    
+
+    // Receive the remaining frames
+    int frameCounter = 1;
+    int recFrameNum;
+    bool errors = false;
+
+    while(!packetComplete && !errors && !timeout_expired){
+
+        frame = (uchar*)read_serial_packet(src, &len);
+
+        if(frame){
+            recFrameNum = *(unsigned short*)&frame[15];
+
+            if( (int)frame[12]!= curPacketID ){
+
+                //if the first frame of a new block has arrived
+                if( (int)frame[15] == 0 && (int)frame[16] == 0 && ((packet_info >> 4)&0x0F==CTA_IMG_PKT || (packet_info >> 4)&0x0F==ATC_IMG_PKT  )){
+
+                    //deallocate old packet
+                    if(dealloc_packet == true){
+                        free(packet);
+                        dealloc_packet = false;
+                    }
+
+                    //restart from the beginning
+                    idx = 0;
+                    frameCounter = 1;
+                    curPacketID = (int)frame[12];
+                    recv_RADIO_packetID = curPacketID;
+                    numFrames   = *(unsigned short*)&frame[13];
+                    packet = (uchar*)malloc(maxFrameLength*numFrames);
+                    dealloc_packet = true;
+                    memcpy( &packet[idx], &frame[tot_header_length], len-tot_header_length );
+                    idx+= len - tot_header_length;
+
+
+
+                    if (numFrames == 1){
+                        packetComplete = true;
+                    }
+                }
+                else{
+                    errors = true;
+                }
+
+            }
+            else{
+                if(recFrameNum != frameCounter)
+                    errors = true;
+            }
+
+
+            if ( !errors ){
+                memcpy( &packet[idx], &(frame[tot_header_length]), len-tot_header_length );
+                idx+= len - tot_header_length;
+                frameCounter++;
+                if(frameCounter==numFrames){
+                    packetComplete = true;
+                }
+            }
+        }
+        else if(timeout>0){
+            waitTime = ((double)cv::getTickCount() - initTime)/cv::getTickFrequency();
+            if(waitTime > timeout){
+                timeout_expired = true;
+                return -2;
+            }
+        }
+
+        if (frame){
+            free(frame);
+        }
+
+    }
+
+    if ( !errors ){
+        *packetLength = idx;
+        *packet_ = packet;
+        //free(temp_packet);
+        
+        return 0;
+
+    }
+    else{
+        *packetLength = -1;
+        //free(temp_packet);
+        return -1;
+    }
+
+
+}
 
 
 int DataTransmission::receivePacketRADIO(serial_source src, uchar **packet_, int *packetLength, double timeout){
@@ -448,11 +622,15 @@ int DataTransmission::receivePacketRADIO(serial_source src, uchar **packet_, int
 
 		frame = (uchar*)read_serial_packet(src, &len);
 
-        if(frame)
+        if(frame){
             packet_info = frame[17];
+            curPacketID = (int)frame[12];
+            recv_RADIO_packetID = curPacketID;
+        }
 
 		if( frame && (int)frame[15] == 0 && (int)frame[16] == 0){
 			curPacketID = (int)frame[12];
+            recv_RADIO_packetID = curPacketID;
 			numFrames   = *(unsigned short*)&frame[13];
 			packet = (uchar*)malloc(maxFrameLength*numFrames);
             dealloc_packet = true;
@@ -660,15 +838,15 @@ int DataTransmission::sendPacketRADIO(serial_source src, int radio_dst, packetTy
 
 		while( ret!=0 && count_resend<max_resend ){
 
-			if(count_resend>0){
+			/*if(count_resend>0){
 				cout << "Resending frame" << endl;
-			}
+			}*/
 			ret = write_serial_packet(src, serial_packet, curFrameLength+tot_header_length);
 
 			if (ret !=0 ){
-				cout << "ERROR SENDING FRAME TO RADIO SUBSYSTEM!" << endl;
+				/*cout << "ERROR SENDING FRAME TO RADIO SUBSYSTEM!" << endl;
 				cout << "FRAME: " << i+1 << " , LENGTH: " << curFrameLength << endl;
-				cout << "RET " << ret << endl;
+				cout << "RET " << ret << endl;*/
 				count_resend++;
 			}
 			//usleep(9500);
@@ -741,8 +919,8 @@ int DataTransmission::getImgInfo(uchar *packet, imgInfo &info){
 		info.atc_cta = false;
 		info.descName = "\n";
 		info.nFeats = -1;
-		info.w =      -1;
-		info.h =      -1;
+        info.w = ((int)(packet[1])) * 16 + (int)( (packet[2]>>4) & 0x0F);
+        info.h = ((int)(packet[2] & 0x0F)) * 256 + (int)(packet[3]);
 		info.compressed = false;
 	}
 	else{ // ATC
@@ -791,14 +969,14 @@ int DataTransmission::getImgInfo(uchar *packet, imgInfo &info){
 
 int DataTransmission::getPacketInfo(uchar *packet, pktInfo &info){
 
-    cout << "Packet INFO" << (int)packet_info << endl;
+   // cout << "Packet INFO" << (int)packet_info << endl;
 
 	// check if the packet is a data packet
     uchar pktType = (packet_info >> 4) & 0x0F;
 	if( pktType != 0x01 && pktType != 0x02 )
 		return -1;
 
-    if     ( pktType == 0x01 ){ // CTA packet
+    if  ( pktType == 0x01 ){ // CTA packet
 		info.atc_cta = false;
         info.imageID = packet_info & 0x0F;
 		info.nFeats = -1;
@@ -811,6 +989,14 @@ int DataTransmission::getPacketInfo(uchar *packet, pktInfo &info){
 
 	return 0;
 
+}
+
+uchar DataTransmission::getPacketID(){
+    return RADIO_packetID;
+}
+
+uchar DataTransmission::getRecvPacketID(){
+    return recv_RADIO_packetID;
 }
 
 /*

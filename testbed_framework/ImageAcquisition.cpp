@@ -8,7 +8,7 @@ void* grab_function( void *ptr )
 	loc_cap = (VideoCapture*) ptr;
 	while(1){
 		loc_cap->grab();
-        usleep(100000);
+		usleep(40000);
 	}
 }
 

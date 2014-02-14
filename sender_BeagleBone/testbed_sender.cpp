@@ -3,6 +3,8 @@
 #include <list>
 #include <algorithm>
 #include <stdlib.h>
+#include <cmath>
+
 
 #include "ImageAcquisition.h"
 #include "VisualFeatureExtraction.h"
@@ -12,6 +14,10 @@
 #include "VisualFeatureDecoding.h"
 
 #include "opencv2/video/video.hpp"
+
+#define BLOCK_H 96
+#define BLOCK_W 640
+#define BLOCK_ATC 10
 
 using namespace std;
 using namespace cv;
@@ -30,6 +36,7 @@ int main(int argc, char ** argv) {
     ImageAcquisition *imAcq;
     Mat imRGB, imGray;
     vector<uchar> JPEGbuff;//buffer for coding
+	vector< vector<uchar> > JPEGbuffslice; //buffer for slice encoding
 
     // Variables for background subtraction
     Mat imGray32;     // 32bits-precision image
@@ -83,7 +90,11 @@ int main(int argc, char ** argv) {
     dataTx = new DataTransmission();
     int RADIO_DST = 0;
     cout << "apro..." << endl;
-    serial_source src = dataTx->openSerialRADIO("/dev/ttyUSB0",115200,1);
+    serial_source src = dataTx->openSerialRADIO(argv[1],115200,1);
+    if(src==NULL){
+        cout << "Error opening the radio device... exiting!" << endl;
+        return -1;
+    }
     cout << "fatto!" << endl;
 
     // Auxiliary variables
@@ -351,21 +362,50 @@ int main(int argc, char ** argv) {
         else if (curState == CTA_PROC){
 
             if(prevState == IMG_ACQ){
+	      
+		
+	      
                 cout << "Compressing image.....";
                 if (send_whole_pic){
                     imAcq->compressJPEG(imGray,opActs->jpeg_qf,JPEGbuff);     // JPEG compression
                 }
                 else{
-                    imAcq->compressJPEG(reducedImg,opActs->jpeg_qf,JPEGbuff); // JPEG compression
+                    //imAcq->compressJPEG(reducedImg,opActs->jpeg_qf,JPEGbuff); // JPEG compression
+					int num_blocks_row = ceil(((float)reducedImg.rows/(float)BLOCK_H));
+					int num_blocks_col = ceil(((float)reducedImg.cols/(float)BLOCK_W));
+					int num_blocks = num_blocks_col*num_blocks_row;
+
+					cout << num_blocks_row << " " << num_blocks_col << endl;
+					
+					JPEGbuffslice.clear();
+					for(int irow=0;irow<num_blocks_row;irow++){
+						for( int icol=0;icol<num_blocks_col;icol++){
+							
+							int min_r = irow*BLOCK_H;
+							int max_r = min((irow+1)*BLOCK_H,reducedImg.rows);
+							
+							int min_c = icol*BLOCK_W;
+							int max_c = min((icol+1)*BLOCK_W,reducedImg.cols);
+							
+							cout << "block: " << min_r << " " << max_r << " " << min_c << " " << max_c << endl;
+							
+							Mat blockImg = Mat(reducedImg, Range(min_r, max_r), Range(min_c, max_c));	
+							vector<uchar> blockJPEGbuff;
+							imAcq->compressJPEG(blockImg,opActs->jpeg_qf,blockJPEGbuff);
+							JPEGbuffslice.push_back(blockJPEGbuff);
+						}
+					}
                 }
 
                 cout << "ok" << endl;
 
                 // Send the image info packet
-                dataTx->sendImgInfoRADIO(src,RADIO_DST,imgID,false);
+		dataTx->sendImgInfoRADIO(src,RADIO_DST,imgID,false,false,"null",0,reducedImg.cols,reducedImg.rows);
+                //dataTx->sendImgInfoRADIO(src,RADIO_DST,imgID,false);
             }
             else if(prevState == WAIT_ACK){
-                dataTx->sendImgInfoRADIO(src,RADIO_DST,imgID,false);
+	        dataTx->sendImgInfoRADIO(src,RADIO_DST,imgID,false,false,"null",0,reducedImg.cols,reducedImg.rows);
+                //dataTx->sendImgInfoRADIO(src,RADIO_DST,imgID,false);
             }
 
             // Update the state
@@ -429,7 +469,7 @@ int main(int argc, char ** argv) {
 
 
                 // Create the bitstreams (1 bitstream per packet)
-                int N = 255; // max number of features per bitstream
+                int N = min(BLOCK_ATC,255); // max number of features per bitstream
                 int B = ceil( (float)kpts.size() / (float)N );
                 if ( kpts.size() == 0 ){
                     B = 0;
@@ -518,9 +558,11 @@ int main(int argc, char ** argv) {
         // -----------------------------------------------------------------------
         else if (curState == SEND_CTA_DATA){
 
-            cout << endl << "Sending jpeg bitstream.....";
+            cout << endl << "Sending jpeg bitstream. Number of blocks = " << JPEGbuffslice.size() << endl ;
             send_time1 = (double)cv::getTickCount();
-            dataTx->sendJpegRADIO(src,RADIO_DST,imgID,JPEGbuff);
+			for(int iblock=0;iblock<JPEGbuffslice.size();iblock++){
+				dataTx->sendJpegRADIO(src,RADIO_DST,imgID,JPEGbuffslice[iblock]);
+			}
             send_time1 = ((double)cv::getTickCount() - send_time1)/cv::getTickFrequency();
             cout << "ok" << endl;
 
